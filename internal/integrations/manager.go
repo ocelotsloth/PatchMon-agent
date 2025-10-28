@@ -146,11 +146,3 @@ func (m *Manager) GetRealtimeIntegrations() []RealtimeIntegration {
 
 	return realtime
 }
-
-
-
-
-
-
-
-

@@ -99,11 +99,3 @@ type DockerResponse struct {
 	ImagesReceived     int    `json:"images_received"`
 	UpdatesFound       int    `json:"updates_found"`
 }
-
-
-
-
-
-
-
-

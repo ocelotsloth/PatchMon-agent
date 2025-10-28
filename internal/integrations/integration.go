@@ -35,11 +35,3 @@ type RealtimeIntegration interface {
 	// StopMonitoring stops real-time monitoring
 	StopMonitoring() error
 }
-
-
-
-
-
-
-
-
