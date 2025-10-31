@@ -39,10 +39,7 @@ func (d *Integration) collectImages(ctx context.Context) ([]models.DockerImage, 
 			// Parse image name
 			repository, tag := parseImageName(repoTag)
 
-			// Determine source
-			source := determineImageSource(repository)
-
-			// Get digest
+			// Get digest first to determine if image is locally built
 			digest := ""
 			if len(img.RepoDigests) > 0 {
 				// Extract just the hash part
@@ -50,6 +47,13 @@ func (d *Integration) collectImages(ctx context.Context) ([]models.DockerImage, 
 				if len(parts) > 1 {
 					digest = strings.TrimPrefix(parts[1], "sha256:")
 				}
+			}
+
+			// Determine source - if no digest, image is locally built
+			source := determineImageSource(repository)
+			if len(img.RepoDigests) == 0 || digest == "" {
+				// No RepoDigests means the image was built locally and never pushed to a registry
+				source = "local"
 			}
 
 			// Convert created timestamp

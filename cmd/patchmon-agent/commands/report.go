@@ -278,7 +278,13 @@ func sendDockerData(httpClient *client.Client, integrationData *models.Integrati
 		AgentVersion: version.Version,
 	}
 
-	logger.Info("Sending Docker data to server...")
+	logger.WithFields(logrus.Fields{
+		"containers": len(dockerData.Containers),
+		"images":     len(dockerData.Images),
+		"volumes":    len(dockerData.Volumes),
+		"networks":   len(dockerData.Networks),
+		"updates":    len(dockerData.Updates),
+	}).Info("Sending Docker data to server...")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -291,6 +297,8 @@ func sendDockerData(httpClient *client.Client, integrationData *models.Integrati
 	logger.WithFields(logrus.Fields{
 		"containers": response.ContainersReceived,
 		"images":     response.ImagesReceived,
+		"volumes":    response.VolumesReceived,
+		"networks":   response.NetworksReceived,
 		"updates":    response.UpdatesFound,
 	}).Info("Docker data sent successfully")
 }

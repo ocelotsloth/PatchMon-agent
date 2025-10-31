@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,6 +104,8 @@ func (d *Integration) Collect(ctx context.Context) (*models.IntegrationData, err
 	dockerData := &models.DockerData{
 		Containers: make([]models.DockerContainer, 0),
 		Images:     make([]models.DockerImage, 0),
+		Volumes:    make([]models.DockerVolume, 0),
+		Networks:   make([]models.DockerNetwork, 0),
 		Updates:    make([]models.DockerImageUpdate, 0),
 	}
 
@@ -122,6 +125,24 @@ func (d *Integration) Collect(ctx context.Context) (*models.IntegrationData, err
 	} else {
 		dockerData.Images = images
 		d.logger.WithField("count", len(images)).Info("Collected images")
+	}
+
+	// Collect volumes
+	volumes, err := d.collectVolumes(ctx)
+	if err != nil {
+		d.logger.WithError(err).Warn("Failed to collect volumes")
+	} else {
+		dockerData.Volumes = volumes
+		d.logger.WithField("count", len(volumes)).Info("Collected volumes")
+	}
+
+	// Collect networks
+	networks, err := d.collectNetworks(ctx)
+	if err != nil {
+		d.logger.WithError(err).Warn("Failed to collect networks")
+	} else {
+		dockerData.Networks = networks
+		d.logger.WithField("count", len(networks)).Info("Collected networks")
 	}
 
 	// Collect daemon info
@@ -213,32 +234,47 @@ func determineImageSource(imageName string) string {
 		return "unknown"
 	}
 
-	// Check for common registries
-	if len(imageName) > 9 && imageName[:9] == "ghcr.io/" {
-		return "github"
-	}
-	if len(imageName) > 20 && imageName[:20] == "registry.gitlab.com/" {
-		return "gitlab"
-	}
-	if len(imageName) > 4 && imageName[:4] == "gcr." {
-		return "google"
-	}
-	if len(imageName) > 4 && imageName[:4] == "quay" {
-		return "quay"
+	// Extract domain from image name
+	parts := strings.SplitN(imageName, "/", 2)
+	if len(parts) == 1 {
+		// No domain specified, it's Docker Hub (implicit docker.io)
+		return "docker-hub"
 	}
 
-	// Count slashes to determine if it's a private registry
-	slashCount := 0
-	for _, ch := range imageName {
-		if ch == '/' {
-			slashCount++
-		}
+	domain := parts[0]
+
+	// Check if first part contains a dot or colon (indicates it's a domain)
+	if !strings.Contains(domain, ".") && !strings.Contains(domain, ":") {
+		// It's a Docker Hub image with org/repo format (e.g., "library/nginx")
+		return "docker-hub"
 	}
-	if slashCount >= 2 {
+
+	// Match known registry domains (inspired by diun)
+	switch {
+	case domain == "docker.io":
+		return "docker-hub"
+	case domain == "ghcr.io":
+		return "github"
+	case domain == "docker.pkg.github.com":
+		return "github"
+	case domain == "registry.gitlab.com":
+		return "gitlab"
+	case strings.HasPrefix(domain, "gcr.io"):
+		return "google"
+	case strings.Contains(domain, "pkg.dev"): // Google Artifact Registry
+		return "google"
+	case domain == "quay.io":
+		return "quay"
+	case domain == "registry.access.redhat.com":
+		return "redhat"
+	case strings.Contains(domain, "azurecr.io"):
+		return "azure"
+	case strings.Contains(domain, "amazonaws.com"): // ECR
+		return "aws"
+	default:
+		// Private registry
 		return "private"
 	}
-
-	return "docker-hub"
 }
 
 // parseImageName parses image name into repository and tag
