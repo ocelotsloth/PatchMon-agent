@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -21,7 +22,8 @@ import (
 )
 
 const (
-	serverTimeout = 30 * time.Second
+	serverTimeout       = 30 * time.Second
+	versionCheckTimeout = 10 * time.Second // Shorter timeout for version checks
 )
 
 type ServerVersionResponse struct {
@@ -102,21 +104,55 @@ func updateAgent() error {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 
+	// Resolve symlinks to get the actual binary path (important for Alpine and other systems)
+	// This ensures we update the actual file, not just a symlink
+	resolvedPath, err := filepath.EvalSymlinks(executablePath)
+	if err != nil {
+		logger.WithError(err).WithField("path", executablePath).Warn("Could not resolve symlinks, using original path")
+		resolvedPath = executablePath
+	} else if resolvedPath != executablePath {
+		logger.WithField("original", executablePath).WithField("resolved", resolvedPath).Debug("Resolved executable symlink")
+		executablePath = resolvedPath
+	}
+
+	// Get current version for comparison
+	currentVersion := strings.TrimPrefix(version.Version, "v")
+
+	// First, check server version info to see if update is needed
+	logger.Debug("Checking server for latest version...")
+	versionInfo, err := getServerVersionInfo()
+	if err != nil {
+		logger.WithError(err).Warn("Failed to get version info, proceeding with update anyway")
+	} else {
+		latestVersion := strings.TrimPrefix(versionInfo.LatestVersion, "v")
+		logger.WithField("current", currentVersion).WithField("latest", latestVersion).Debug("Version check")
+
+		// Check if update is actually needed
+		if currentVersion == latestVersion && !versionInfo.HasUpdate {
+			logger.WithField("version", currentVersion).Info("Agent is already at the latest version, skipping update")
+			return nil
+		}
+	}
+
 	// Get latest binary info from server
 	binaryInfo, err := getLatestBinaryFromServer()
 	if err != nil {
 		return fmt.Errorf("failed to get latest binary information: %w", err)
 	}
 
-	logger.WithField("version", binaryInfo.Version).Info("Found latest version")
-
-	logger.Info("Using downloaded agent binary...")
-
-	// Use the binary data directly from the server response
 	newAgentData := binaryInfo.BinaryData
 	if len(newAgentData) == 0 {
 		return fmt.Errorf("no binary data received from server")
 	}
+
+	// Get the new version from server version info (more reliable than parsing binary output)
+	newVersion := currentVersion // Default to current if we can't determine
+	if versionInfo != nil && versionInfo.LatestVersion != "" {
+		newVersion = strings.TrimPrefix(versionInfo.LatestVersion, "v")
+	}
+
+	logger.WithField("current", currentVersion).WithField("new", newVersion).Info("Proceeding with update")
+	logger.Info("Using downloaded agent binary...")
 
 	// Create backup of current executable
 	backupPath := fmt.Sprintf("%s.backup.%s", executablePath, time.Now().Format("20060102_150405"))
@@ -125,37 +161,56 @@ func updateAgent() error {
 	}
 	logger.WithField("path", backupPath).Info("Backup saved")
 
-	// Write new version to temporary file
+	// Write new version to temporary file (reuse the temp file we already created for version check)
 	tempPath := executablePath + ".new"
 	if err := os.WriteFile(tempPath, newAgentData, 0755); err != nil {
 		return fmt.Errorf("failed to write new agent: %w", err)
 	}
 
 	// Verify the new executable works
+	logger.Debug("Validating new executable...")
 	testCmd := exec.Command(tempPath, "check-version")
+	testCmd.Env = os.Environ() // Preserve environment variables
 	if err := testCmd.Run(); err != nil {
 		if removeErr := os.Remove(tempPath); removeErr != nil {
 			logger.WithError(removeErr).Warn("Failed to remove temporary file after validation failure")
 		}
 		return fmt.Errorf("new agent executable is invalid: %w", err)
 	}
+	logger.Debug("New executable validation passed")
 
-	// Replace current executable
+	// Replace current executable atomically
+	// On Linux, we can rename over a running executable - the old process keeps using the old inode
+	// When the service restarts, it will use the new binary
+	logger.Debug("Replacing executable atomically...")
 	if err := os.Rename(tempPath, executablePath); err != nil {
 		if removeErr := os.Remove(tempPath); removeErr != nil {
 			logger.WithError(removeErr).Warn("Failed to remove temporary file after rename failure")
 		}
+		// Check if it's a filesystem/permission issue
+		if os.IsPermission(err) {
+			return fmt.Errorf("failed to replace executable (permission denied): %w. Ensure the binary is writable", err)
+		}
 		return fmt.Errorf("failed to replace executable: %w", err)
+	}
+
+	// Ensure the new binary has correct permissions (in case umask affected it)
+	if err := os.Chmod(executablePath, 0755); err != nil {
+		logger.WithError(err).Warn("Failed to set executable permissions on new binary")
+		// Don't fail the update for this, but log it
 	}
 
 	logger.WithField("version", binaryInfo.Version).Info("Agent updated successfully")
 
-	// Restart the systemd service to pick up the new binary
-	logger.Info("Restarting patchmon-agent service...")
+	// Restart the service to pick up the new binary
+	// This is critical - the old process is still running the old binary
+	logger.Info("Restarting patchmon-agent service to load new binary...")
 	if err := restartService(); err != nil {
-		logger.WithError(err).Warn("Failed to restart service (this is not critical)")
+		logger.WithError(err).Error("Failed to restart service - new binary is in place but old process is still running")
+		logger.Warn("Manual service restart required to complete update")
+		return fmt.Errorf("update completed but service restart failed: %w", err)
 	} else {
-		logger.Info("Service restarted successfully")
+		logger.Info("Service restarted successfully - new binary is now active")
 	}
 
 	// Send updated information to PatchMon
@@ -187,7 +242,7 @@ func getServerVersionInfo() (*ServerVersionInfo, error) {
 	currentVersion := strings.TrimPrefix(version.Version, "v")
 	url := fmt.Sprintf("%s/api/v1/hosts/agent/version?arch=%s&type=go&currentVersion=%s", cfg.PatchmonServer, architecture, currentVersion)
 
-	ctx, cancel := context.WithTimeout(context.Background(), serverTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), versionCheckTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -199,7 +254,25 @@ func getServerVersionInfo() (*ServerVersionInfo, error) {
 	req.Header.Set("X-API-ID", credentials.APIID)
 	req.Header.Set("X-API-KEY", credentials.APIKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Create HTTP client with proper timeouts (shorter for version checks)
+	httpClient := &http.Client{
+		Timeout: versionCheckTimeout,
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 5 * time.Second,
+		},
+	}
+
+	// Configure for insecure SSL if needed
+	if cfg.SkipSSLVerify {
+		httpClient.Transport = &http.Transport{
+			ResponseHeaderTimeout: 5 * time.Second,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -311,19 +384,76 @@ func copyFile(src, dst string) error {
 	return os.WriteFile(dst, data, 0755)
 }
 
-// restartService restarts the patchmon-agent systemd service
+// restartService restarts the patchmon-agent service (supports systemd and OpenRC)
 func restartService() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "systemctl", "restart", "patchmon-agent")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to restart service: %w, output: %s", err, string(output))
-	}
+	// Detect init system and use appropriate restart command
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		// Systemd is available
+		logger.Debug("Detected systemd, using systemctl restart")
+		cmd := exec.CommandContext(ctx, "systemctl", "restart", "patchmon-agent")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to restart service: %w, output: %s", err, string(output))
+		}
+		logger.WithField("output", string(output)).Debug("Service restart command completed")
+		return nil
+	} else if _, err := exec.LookPath("rc-service"); err == nil {
+		// OpenRC is available (Alpine Linux)
+		// Since we're running inside the service, we can't stop ourselves directly
+		// Instead, we'll create a helper script that runs after we exit
+		logger.Debug("Detected OpenRC, scheduling service restart via helper script")
 
-	logger.WithField("output", string(output)).Debug("Service restart command completed")
-	return nil
+		// Create a helper script that will restart the service after we exit
+		helperScript := `#!/bin/sh
+# Wait a moment for the current process to exit
+sleep 2
+# Restart the service
+rc-service patchmon-agent restart 2>&1 || rc-service patchmon-agent start 2>&1
+# Clean up this script
+rm -f "$0"
+`
+		helperPath := "/etc/patchmon/patchmon-restart-helper.sh"
+		if err := os.WriteFile(helperPath, []byte(helperScript), 0755); err != nil {
+			logger.WithError(err).Warn("Failed to create restart helper script, will exit and rely on OpenRC auto-restart")
+			// Fall through to exit approach
+		} else {
+			// Execute the helper script in background (detached from current process)
+			// Use 'sh -c' with nohup to ensure it runs after we exit
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("nohup %s > /dev/null 2>&1 &", helperPath))
+			if err := cmd.Start(); err != nil {
+				logger.WithError(err).Warn("Failed to start restart helper script, will exit and rely on OpenRC auto-restart")
+				// Clean up script
+				os.Remove(helperPath)
+				// Fall through to exit approach
+			} else {
+				logger.Info("Scheduled service restart via helper script, exiting now...")
+				// Give the helper script a moment to start
+				time.Sleep(500 * time.Millisecond)
+				// Exit gracefully - the helper script will restart the service
+				os.Exit(0)
+			}
+		}
+
+		// Fallback: If helper script approach failed, just exit and let OpenRC handle it
+		// OpenRC with command_background="yes" should restart on exit
+		logger.Info("Exiting to allow OpenRC to restart service with new binary...")
+		os.Exit(0)
+		// os.Exit never returns, but we need this for code flow
+		return nil
+	} else {
+		// Fallback: try to kill and let service manager restart it
+		logger.Warn("No known init system detected, attempting to restart via process signal")
+		// Try to find and kill the process, service manager should restart it
+		killCmd := exec.CommandContext(ctx, "pkill", "-HUP", "patchmon-agent")
+		if err := killCmd.Run(); err != nil {
+			return fmt.Errorf("failed to restart service: no init system detected and pkill failed: %w", err)
+		}
+		logger.Info("Sent HUP signal to agent process")
+		return nil
+	}
 }
 
 // Removed update-crontab command (cron is no longer used)
