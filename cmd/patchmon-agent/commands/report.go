@@ -82,6 +82,21 @@ func sendReport() error {
 	// Get network information
 	logger.Info("Collecting network information...")
 	networkInfo := networkMgr.GetNetworkInfo()
+	// Ensure DNSServers is never nil (should be empty slice, not nil)
+	if networkInfo.DNSServers == nil {
+		networkInfo.DNSServers = []string{}
+	}
+
+	// Check if reboot is required and get installed kernel
+	logger.Info("Checking reboot status...")
+	needsReboot, rebootReason := systemDetector.CheckRebootRequired()
+	installedKernel := systemDetector.GetLatestInstalledKernel()
+	logger.WithFields(logrus.Fields{
+		"needs_reboot":        needsReboot,
+		"reason":              rebootReason,
+		"installed_kernel":    installedKernel,
+		"running_kernel":      systemInfo.KernelVersion,
+	}).Info("Reboot status check completed")
 
 	// Get package information
 	logger.Info("Collecting package information...")
@@ -155,9 +170,10 @@ func sendReport() error {
 		IP:                ipAddress,
 		Architecture:      architecture,
 		AgentVersion:      version.Version,
-		MachineID:         systemDetector.GetMachineID(),
-		KernelVersion:     systemInfo.KernelVersion,
-		SELinuxStatus:     systemInfo.SELinuxStatus,
+		MachineID:             systemDetector.GetMachineID(),
+		KernelVersion:         systemInfo.KernelVersion,
+		InstalledKernelVersion: installedKernel,
+		SELinuxStatus:         systemInfo.SELinuxStatus,
 		SystemUptime:      systemInfo.SystemUptime,
 		LoadAverage:       systemInfo.LoadAverage,
 		CPUModel:          hardwareInfo.CPUModel,
@@ -169,6 +185,8 @@ func sendReport() error {
 		DNSServers:        networkInfo.DNSServers,
 		NetworkInterfaces: networkInfo.NetworkInterfaces,
 		ExecutionTime:     executionTime,
+		NeedsReboot:       needsReboot,
+		RebootReason:      rebootReason,
 	}
 
 	// Send report
@@ -196,27 +214,40 @@ func sendReport() error {
 			logger.WithError(err).Warn("PatchMon agent update failed, but data was sent successfully")
 		} else {
 			logger.Info("PatchMon agent update completed successfully")
+			// updateAgent() will exit the process after restart, so we won't reach here
+			// But if it does return, skip the update check to prevent loops
+			return nil
 		}
 	} else {
-		// Proactive update check after report
-		logger.Info("Checking for agent updates...")
-		versionInfo, err := getServerVersionInfo()
-		if err != nil {
-			logger.WithError(err).Warn("Failed to check for updates after report")
-		} else if versionInfo.HasUpdate {
-			logger.WithFields(logrus.Fields{
-				"current": versionInfo.CurrentVersion,
-				"latest":  versionInfo.LatestVersion,
-			}).Info("Update available, automatically updating...")
-
-			if err := updateAgent(); err != nil {
-				logger.WithError(err).Warn("PatchMon agent update failed, but data was sent successfully")
-			} else {
-				logger.Info("PatchMon agent update completed successfully")
+		// Proactive update check after report (non-blocking with timeout)
+		// Run in a goroutine to avoid blocking the report completion
+		go func() {
+			// Add a delay to prevent immediate checks after service restart
+			// This gives the new process time to fully initialize
+			time.Sleep(5 * time.Second)
+			
+			logger.Info("Checking for agent updates...")
+			versionInfo, err := getServerVersionInfo()
+			if err != nil {
+				logger.WithError(err).Warn("Failed to check for updates after report (non-critical)")
+				return
 			}
-		} else {
-			logger.WithField("version", versionInfo.CurrentVersion).Debug("Agent is up to date")
-		}
+			if versionInfo.HasUpdate {
+				logger.WithFields(logrus.Fields{
+					"current": versionInfo.CurrentVersion,
+					"latest":  versionInfo.LatestVersion,
+				}).Info("Update available, automatically updating...")
+
+				if err := updateAgent(); err != nil {
+					logger.WithError(err).Warn("PatchMon agent update failed, but data was sent successfully")
+				} else {
+					logger.Info("PatchMon agent update completed successfully")
+					// updateAgent() will exit after restart, so this won't be reached
+				}
+			} else {
+				logger.WithField("version", versionInfo.CurrentVersion).Info("Agent is up to date")
+			}
+		}()
 	}
 
 	// Collect and send integration data (Docker, etc.) separately

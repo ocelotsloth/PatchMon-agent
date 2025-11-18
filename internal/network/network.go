@@ -102,7 +102,8 @@ func parseHexByte(hex string) (byte, error) {
 
 // getDNSServers gets the configured DNS servers from resolv.conf
 func (m *Manager) getDNSServers() []string {
-	var servers []string
+	// Initialize as empty slice (not nil) to ensure JSON marshals as [] instead of null
+	servers := []string{}
 
 	// Read /etc/resolv.conf
 	data, err := os.ReadFile("/etc/resolv.conf")

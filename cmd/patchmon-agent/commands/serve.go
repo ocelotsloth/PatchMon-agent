@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -330,18 +331,76 @@ func toggleIntegration(integrationName string, enabled bool) error {
 
 	logger.Info("Config updated, restarting patchmon-agent service...")
 
-	// Restart the service to apply changes
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Restart the service to apply changes (supports systemd and OpenRC)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "systemctl", "restart", "patchmon-agent")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		logger.WithError(err).Warn("Failed to restart service (this is not critical)")
-		return fmt.Errorf("failed to restart service: %w, output: %s", err, string(output))
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		// Systemd is available
+		logger.Debug("Detected systemd, using systemctl restart")
+		cmd := exec.CommandContext(ctx, "systemctl", "restart", "patchmon-agent")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			logger.WithError(err).Warn("Failed to restart service (this is not critical)")
+			return fmt.Errorf("failed to restart service: %w, output: %s", err, string(output))
+		}
+		logger.WithField("output", string(output)).Debug("Service restart command completed")
+		logger.Info("Service restarted successfully")
+		return nil
+	} else if _, err := exec.LookPath("rc-service"); err == nil {
+		// OpenRC is available (Alpine Linux)
+		// Since we're running inside the service, we can't stop ourselves directly
+		// Instead, we'll create a helper script that runs after we exit
+		logger.Debug("Detected OpenRC, scheduling service restart via helper script")
+		
+		// Create a helper script that will restart the service after we exit
+		helperScript := `#!/bin/sh
+# Wait a moment for the current process to exit
+sleep 2
+# Restart the service
+rc-service patchmon-agent restart 2>&1 || rc-service patchmon-agent start 2>&1
+# Clean up this script
+rm -f "$0"
+`
+		helperPath := "/etc/patchmon/patchmon-restart-helper.sh"
+		if err := os.WriteFile(helperPath, []byte(helperScript), 0755); err != nil {
+			logger.WithError(err).Warn("Failed to create restart helper script, will exit and rely on OpenRC auto-restart")
+			// Fall through to exit approach
+		} else {
+			// Execute the helper script in background (detached from current process)
+			// Use 'sh -c' with nohup to ensure it runs after we exit
+			cmd := exec.Command("sh", "-c", fmt.Sprintf("nohup %s > /dev/null 2>&1 &", helperPath))
+			if err := cmd.Start(); err != nil {
+				logger.WithError(err).Warn("Failed to start restart helper script, will exit and rely on OpenRC auto-restart")
+				// Clean up script
+				if removeErr := os.Remove(helperPath); removeErr != nil {
+					logger.WithError(removeErr).Debug("Failed to remove helper script")
+				}
+				// Fall through to exit approach
+			} else {
+				logger.Info("Scheduled service restart via helper script, exiting now...")
+				// Give the helper script a moment to start
+				time.Sleep(500 * time.Millisecond)
+				// Exit gracefully - the helper script will restart the service
+				os.Exit(0)
+			}
+		}
+		
+		// Fallback: If helper script approach failed, just exit and let OpenRC handle it
+		// OpenRC with command_background="yes" should restart on exit
+		logger.Info("Exiting to allow OpenRC to restart service with updated config...")
+		os.Exit(0)
+		// os.Exit never returns, but we need this for code flow
+		return nil
+	} else {
+		logger.Warn("No known init system detected, attempting to restart via process signal")
+		// Try to find and kill the process, service manager should restart it
+		killCmd := exec.CommandContext(ctx, "pkill", "-HUP", "patchmon-agent")
+		if err := killCmd.Run(); err != nil {
+			logger.WithError(err).Warn("Failed to restart service (this is not critical)")
+			return fmt.Errorf("failed to restart service: no init system detected and pkill failed: %w", err)
+		}
+		logger.Info("Sent HUP signal to agent process")
+		return nil
 	}
-
-	logger.WithField("output", string(output)).Debug("Service restart command completed")
-	logger.Info("Service restarted successfully")
-	return nil
 }
