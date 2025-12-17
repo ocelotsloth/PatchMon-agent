@@ -11,10 +11,11 @@ import (
 
 // Manager handles package information collection
 type Manager struct {
-	logger     *logrus.Logger
-	aptManager *APTManager
-	dnfManager *DNFManager
-	apkManager *APKManager
+	logger        *logrus.Logger
+	aptManager    *APTManager
+	dnfManager    *DNFManager
+	apkManager    *APKManager
+	pacmanManager *PacmanManager
 }
 
 // New creates a new package manager
@@ -22,12 +23,14 @@ func New(logger *logrus.Logger) *Manager {
 	aptManager := NewAPTManager(logger)
 	dnfManager := NewDNFManager(logger)
 	apkManager := NewAPKManager(logger)
+	pacmanManager := NewPacmanManager(logger)
 
 	return &Manager{
-		logger:     logger,
-		aptManager: aptManager,
-		dnfManager: dnfManager,
-		apkManager: apkManager,
+		logger:        logger,
+		aptManager:    aptManager,
+		dnfManager:    dnfManager,
+		apkManager:    apkManager,
+		pacmanManager: pacmanManager,
 	}
 }
 
@@ -44,6 +47,8 @@ func (m *Manager) GetPackages() ([]models.Package, error) {
 		return m.dnfManager.GetPackages(), nil
 	case "apk":
 		return m.apkManager.GetPackages(), nil
+	case "pacman":
+		return m.pacmanManager.GetPackages()
 	default:
 		return nil, fmt.Errorf("unsupported package manager: %s", packageManager)
 	}
@@ -70,6 +75,11 @@ func (m *Manager) detectPackageManager() string {
 	}
 	if _, err := exec.LookPath("yum"); err == nil {
 		return "yum"
+	}
+
+	// Check for Pacman
+	if _, err := exec.LookPath("pacman"); err == nil {
+		return "pacman"
 	}
 
 	return "unknown"
